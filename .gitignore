@@ -1,0 +1,11 @@
+.cache/
+build/
+third_party/onnx.proto3.pb.cc
+third_party/onnx.proto3.pb.h
+*.onnx
+*.onnx.data
+*.jpg
+*.bin
+__pycache__/
+*.pyc
+.DS_Store
