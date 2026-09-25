@@ -3,6 +3,8 @@
 #include <sstream>
 #include <map>
 #include <string>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -177,13 +179,127 @@ std::vector<int64_t> read_int64_data(const onnx::TensorProto& proto, ExternalDat
     return result;
 }
 
+// Stage 6 scratch harness: compares conv2d() against conv2d_im2col() on the REAL
+// tensors flowing through the graph (a node's actual input activation, weight and bias
+// at the moment it executes), not synthetic data. Enabled with --conv-check.
+struct ConvCheck {
+    bool enabled = false;
+    std::vector<int> node_indices;   // empty => every Conv node
+    int failures = 0;
+
+    bool wants(int node_index) const {
+        if (!enabled) return false;
+        if (node_indices.empty()) return true;
+        return std::find(node_indices.begin(), node_indices.end(), node_index) !=
+               node_indices.end();
+    }
+
+    void print_header() const {
+        std::cout << "\n--- Stage 6: conv2d() vs conv2d_im2col() on real nodes ---" << std::endl;
+        std::cout << std::left << std::setw(6) << "NODE"
+                  << std::setw(20) << "INPUT"
+                  << std::setw(20) << "WEIGHT"
+                  << std::setw(7) << "GRP"
+                  << std::setw(5) << "S"
+                  << std::setw(5) << "P"
+                  << std::right << std::setw(12) << "NAIVE(ms)"
+                  << std::setw(12) << "IM2COL(ms)"
+                  << std::setw(10) << "SPEEDUP"
+                  << std::setw(13) << "MAX |DIFF|"
+                  << std::setw(8) << "RESULT" << std::endl;
+    }
+
+    // Returns the im2col output so the caller can keep executing the graph with it.
+    Tensor compare(int node_index, const Tensor& x, const Tensor& w, const Tensor& bias,
+                   int stride, int padding, int groups, float tolerance) {
+        using Clock = std::chrono::high_resolution_clock;
+
+        auto t0 = Clock::now();
+        Tensor naive = conv2d(x, w, bias, stride, padding, groups);
+        auto t1 = Clock::now();
+        Tensor fast = conv2d_im2col(x, w, bias, stride, padding, groups);
+        auto t2 = Clock::now();
+
+        double naive_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        double fast_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+        bool ok = naive.shape() == fast.shape();
+        float max_diff = 0.0f;
+        if (ok) {
+            for (size_t i = 0; i < naive.size(); ++i) {
+                max_diff = std::max(max_diff,
+                                    std::fabs(naive.raw_data()[i] - fast.raw_data()[i]));
+            }
+            ok = max_diff <= tolerance;
+        }
+        if (!ok) ++failures;
+
+        auto shape_str = [](const std::vector<int>& s) {
+            std::ostringstream oss;
+            oss << "[";
+            for (size_t i = 0; i < s.size(); ++i) {
+                oss << s[i];
+                if (i + 1 < s.size()) oss << "x";
+            }
+            oss << "]";
+            return oss.str();
+        };
+
+        std::cout << std::left << std::setw(6) << node_index
+                  << std::setw(20) << shape_str(x.shape())
+                  << std::setw(20) << shape_str(w.shape())
+                  << std::setw(7) << (groups == w.shape()[0] && groups > 1
+                                          ? "DW(" + std::to_string(groups) + ")"
+                                          : std::to_string(groups))
+                  << std::setw(5) << stride
+                  << std::setw(5) << padding
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(12) << naive_ms
+                  << std::setw(12) << fast_ms
+                  << std::setw(9) << (fast_ms > 0.0 ? naive_ms / fast_ms : 0.0) << "x"
+                  << std::scientific << std::setprecision(3) << std::setw(13) << max_diff
+                  << std::defaultfloat
+                  << std::setw(8) << (ok ? "PASS" : "FAIL") << std::endl;
+
+        return fast;
+    }
+};
+
+// One class label per line, ordered by class index. Returns empty if the file is missing.
+std::vector<std::string> load_labels(const std::string& path) {
+    std::vector<std::string> labels;
+    std::ifstream file(path);
+    std::string line;
+    while (std::getline(file, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        labels.push_back(line);
+    }
+    return labels;
+}
+
 int run(int argc, char** argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_onnx_file>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <path_to_onnx_file> [--conv-check[=n,n,...]]"
+                  << std::endl;
         return 1;
     }
 
+    auto run_start = std::chrono::high_resolution_clock::now();
     std::string model_path = argv[1];
+
+    ConvCheck conv_check;
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg.rfind("--conv-check", 0) != 0) continue;
+        conv_check.enabled = true;
+        if (arg.size() > 13 && arg[12] == '=') {
+            std::stringstream ss(arg.substr(13));
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) conv_check.node_indices.push_back(std::stoi(tok));
+            }
+        }
+    }
 
     std::ifstream input(model_path, std::ios::binary);
     if (!input.is_open()) {
@@ -276,18 +392,41 @@ int run(int argc, char** argv) {
     }
     tensors["input"] = input_tensor;
 
+    // Per-op-TYPE wall-clock accounting. Keyed by op_type so all 52 Conv nodes roll up
+    // into one number -- the question is "which kind of op owns the runtime", not
+    // "which individual node".
+    std::map<std::string, double> time_by_op_type_ms;
+    std::map<std::string, int> count_by_op_type;
+    using Clock = std::chrono::high_resolution_clock;
+
+    if (conv_check.enabled) conv_check.print_header();
+
+    auto graph_start = Clock::now();
+
     for (int i = 0; i < graph.node_size(); ++i) {
         const onnx::NodeProto& node = graph.node(i);
+        auto node_start = Clock::now();
 
         if (node.op_type() == "Gemm") {
             const Tensor& x = get_tensor(tensors, node.input(0));
             const Tensor& w = get_tensor(tensors, node.input(1));
             const Tensor& bias = get_tensor(tensors, node.input(2));
 
-            Tensor w_t({w.shape()[1], w.shape()[0]});
-            for (int r = 0; r < w.shape()[0]; ++r) {
-                for (int c = 0; c < w.shape()[1]; ++c) {
-                    w_t.at({c, r}) = w.at({r, c});
+            // ONNX Gemm stores the weight as [out_features, in_features]; matmul() needs
+            // [in_features, out_features]. Raw pointer arithmetic rather than at(): the
+            // old version constructed a std::vector<int> per element, which for the
+            // 1000x1280 classifier weight meant ~1.28M heap allocations -- the same
+            // pattern that used to dominate matmul(). This is pure data movement, no
+            // arithmetic, so the transposed buffer is bit-identical either way.
+            int w_rows = w.shape()[0];
+            int w_cols = w.shape()[1];
+            Tensor w_t({w_cols, w_rows});
+            const float* w_src = w.raw_data().data();
+            float* w_dst = w_t.raw_data().data();
+            for (int r = 0; r < w_rows; ++r) {
+                const float* src_row = w_src + static_cast<size_t>(r) * w_cols;
+                for (int c = 0; c < w_cols; ++c) {
+                    w_dst[static_cast<size_t>(c) * w_rows + r] = src_row[c];
                 }
             }
 
@@ -316,7 +455,12 @@ int run(int argc, char** argv) {
             int padding = get_list_attribute_first(node, "pads", 0);
             int groups = get_int_attribute(node, "group", 1);
 
-            tensors[node.output(0)] = conv2d(x, w, bias, stride, padding, groups);
+            // Stage 6: im2col + GEMM is the production path. conv2d() remains in ops.cpp
+            // as the naive reference the --conv-check harness validates against.
+            tensors[node.output(0)] =
+                conv_check.wants(i)
+                    ? conv_check.compare(i, x, w, bias, stride, padding, groups, 1e-4f)
+                    : conv2d_im2col(x, w, bias, stride, padding, groups);
         }
         else if (node.op_type() == "BatchNormalization") {
             const Tensor& x = get_tensor(tensors, node.input(0));
@@ -374,6 +518,55 @@ int run(int argc, char** argv) {
             std::vector<int> new_shape(shape_data.begin(), shape_data.end());
             tensors[node.output(0)] = reshape(get_tensor(tensors, node.input(0)), new_shape);
         }
+
+        std::chrono::duration<double, std::milli> node_ms = Clock::now() - node_start;
+        time_by_op_type_ms[node.op_type()] += node_ms.count();
+        count_by_op_type[node.op_type()] += 1;
+    }
+
+    std::chrono::duration<double, std::milli> graph_ms = Clock::now() - graph_start;
+
+    if (conv_check.enabled) {
+        std::cout << (conv_check.failures == 0
+                          ? "conv-check: ALL NODES MATCH within 1e-4"
+                          : "conv-check: " + std::to_string(conv_check.failures) + " NODE(S) FAILED")
+                  << std::endl;
+        if (conv_check.failures != 0) return 1;
+    }
+
+    {
+        std::vector<std::pair<std::string, double>> sorted(time_by_op_type_ms.begin(),
+                                                           time_by_op_type_ms.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.second > b.second; });
+
+        double total_op_ms = 0.0;
+        for (const auto& kv : sorted) total_op_ms += kv.second;
+
+        std::cout << "\n--- Profile: time by op type (slowest first) ---" << std::endl;
+        std::cout << std::left << std::setw(22) << "OP TYPE"
+                  << std::right << std::setw(7) << "NODES"
+                  << std::setw(14) << "TOTAL (ms)"
+                  << std::setw(14) << "AVG (ms)"
+                  << std::setw(10) << "% OPS" << std::endl;
+        for (const auto& [op_type, ms] : sorted) {
+            int n = count_by_op_type[op_type];
+            std::cout << std::left << std::setw(22) << op_type
+                      << std::right << std::setw(7) << n
+                      << std::fixed << std::setprecision(3)
+                      << std::setw(14) << ms
+                      << std::setw(14) << (ms / n)
+                      << std::setprecision(2)
+                      << std::setw(9) << (total_op_ms > 0.0 ? 100.0 * ms / total_op_ms : 0.0) << "%"
+                      << std::defaultfloat << std::endl;
+        }
+        std::cout << std::left << std::setw(22) << "TOTAL"
+                  << std::right << std::setw(7) << graph.node_size()
+                  << std::fixed << std::setprecision(3) << std::setw(14) << total_op_ms
+                  << std::defaultfloat << std::endl;
+        std::cout << "\nGraph execution wall clock: "
+                  << std::fixed << std::setprecision(3) << graph_ms.count() << " ms"
+                  << std::defaultfloat << std::endl;
     }
 
     const Tensor& final_output = get_tensor(tensors, graph.output(0).name());
@@ -388,19 +581,92 @@ int run(int argc, char** argv) {
     }
     std::cout << "]" << std::endl;
 
-    // Rank the class logits so a MobileNetV2 run reads as predictions, not raw floats.
-    int top_k = std::min<int>(5, static_cast<int>(scores.size()));
-    std::vector<int> ranked(scores.size());
-    for (size_t i = 0; i < ranked.size(); ++i) ranked[i] = static_cast<int>(i);
-    std::partial_sort(ranked.begin(), ranked.begin() + top_k, ranked.end(),
-                      [&scores](int a, int b) { return scores[a] > scores[b]; });
+    // Numerical diff against PyTorch's raw logits (pre-softmax), read with the same
+    // flat-float32 layout as input.bin. Optional: models without a reference file skip it.
+    {
+        std::cout << "\n--- Validation vs PyTorch ---" << std::endl;
+        std::ifstream ref_file("pytorch_output.bin", std::ios::binary);
+        if (!ref_file.is_open()) {
+            std::cout << "pytorch_output.bin not found, skipping numerical diff" << std::endl;
+        } else {
+            std::vector<float> reference(scores.size());
+            ref_file.read(reinterpret_cast<char*>(reference.data()),
+                          reference.size() * sizeof(float));
+            // The file is looked up in the working directory, so it may belong to a
+            // different model (e.g. MobileNet's 1000 logits when running tiny_mlp). A
+            // size mismatch in either direction means "not our reference": skip rather
+            // than diff against zero-filled or truncated data.
+            bool size_ok = static_cast<size_t>(ref_file.gcount()) == reference.size() * sizeof(float) &&
+                           ref_file.peek() == std::ifstream::traits_type::eof();
+            if (!size_ok) {
+                std::cout << "pytorch_output.bin does not hold " << scores.size()
+                          << " floats (belongs to a different model?), skipping numerical diff"
+                          << std::endl;
+            } else {
+                const float tolerance = 1e-3f;
+                float max_diff = 0.0f;
+                int max_diff_idx = 0;
+                for (size_t i = 0; i < scores.size(); ++i) {
+                    float d = std::fabs(scores[i] - reference[i]);
+                    if (d > max_diff) {
+                        max_diff = d;
+                        max_diff_idx = static_cast<int>(i);
+                    }
+                }
+                std::cout << "Max |Lyra - PyTorch|: " << std::scientific << std::setprecision(3)
+                          << max_diff << std::defaultfloat << " at class " << max_diff_idx
+                          << " (Lyra " << scores[max_diff_idx] << ", PyTorch "
+                          << reference[max_diff_idx] << ")" << std::endl;
+                std::cout << (max_diff <= tolerance ? "VALIDATION PASSED" : "VALIDATION FAILED")
+                          << " (tolerance 1e-3)" << std::endl;
+            }
+        }
+    }
 
-    std::cout << "\nLyra top " << top_k << " predictions (class index : score):" << std::endl;
+    // Softmax is a display-only step: logits -> probabilities for the top-k printout.
+    Tensor probs_tensor = softmax(final_output);
+    const std::vector<float>& probs = probs_tensor.raw_data();
+
+    int top_k = std::min<int>(5, static_cast<int>(scores.size()));
+    auto rank_top_k = [top_k](const std::vector<float>& v) {
+        std::vector<int> idx(v.size());
+        for (size_t i = 0; i < idx.size(); ++i) idx[i] = static_cast<int>(i);
+        std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+                          [&v](int a, int b) { return v[a] > v[b]; });
+        idx.resize(top_k);
+        return idx;
+    };
+    std::vector<int> ranked = rank_top_k(probs);
+
+    // Softmax is monotonic, so the ranking must match the logit ranking exactly.
+    if (ranked != rank_top_k(scores)) {
+        throw std::runtime_error("softmax reordered the top-" + std::to_string(top_k) +
+                                 " classes; softmax() or the ranking is broken");
+    }
+
+    // Labels are optional: only used if the file exists and has one line per output class
+    // (so a non-ImageNet model like tiny_mlp just gets bare indices).
+    std::vector<std::string> labels = load_labels("imagenet_classes.txt");
+    if (!labels.empty() && labels.size() != scores.size()) {
+        std::cout << "\nimagenet_classes.txt has " << labels.size() << " labels but the model has "
+                  << scores.size() << " outputs; printing indices only" << std::endl;
+        labels.clear();
+    }
+
+    std::cout << "\nLyra top " << top_k << " predictions (class index: label - confidence):"
+              << std::endl;
     for (int i = 0; i < top_k; ++i) {
-        std::cout << "  class " << ranked[i] << ": "
-                  << std::fixed << std::setprecision(4) << scores[ranked[i]]
+        std::cout << "  " << ranked[i] << ": ";
+        if (!labels.empty()) std::cout << labels[ranked[i]] << " - ";
+        std::cout << std::fixed << std::setprecision(1) << 100.0f * probs[ranked[i]] << "%"
                   << std::defaultfloat << std::endl;
     }
+
+    std::chrono::duration<double, std::milli> run_ms =
+        std::chrono::high_resolution_clock::now() - run_start;
+    std::cout << "\nTotal wall clock (parse + load + execute): "
+              << std::fixed << std::setprecision(3) << run_ms.count() << " ms"
+              << std::defaultfloat << std::endl;
 
     return 0;
 }

@@ -1,5 +1,6 @@
 .cache/
 build/
+build-release/
 third_party/onnx.proto3.pb.cc
 third_party/onnx.proto3.pb.h
 *.onnx
